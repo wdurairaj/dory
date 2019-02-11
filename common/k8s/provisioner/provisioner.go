@@ -18,11 +18,11 @@ package provisioner
 
 import (
 	"fmt"
+	uuid "github.com/satori/go.uuid"
 	"github.com/hpe-storage/dory/common/chain"
 	"github.com/hpe-storage/dory/common/docker/dockervol"
 	"github.com/hpe-storage/dory/common/jconfig"
 	"github.com/hpe-storage/dory/common/util"
-	uuid "github.com/satori/go.uuid"
 	"k8s.io/api/core/v1"
 	api_v1 "k8s.io/api/core/v1"
 	storage_v1 "k8s.io/api/storage/v1"
@@ -51,7 +51,7 @@ const (
 	//TODO allow this to be set per docker volume driver
 	maxCreates = 4
 	//TODO allow this to be set per docker volume driver
-	maxDeletes                 = 4
+	maxDeletes                 = 10
 	defaultSocketFile          = "/run/docker/plugins/nimble.sock"
 	defaultfactorForConversion = 1073741824
 	defaultStripValue          = true
@@ -61,6 +61,8 @@ const (
 	cloneOfPVC                 = "cloneOfPVC"
 	manager                    = "manager"
 	managerName                = "k8s"
+	id2chanMapSize             = 1024
+	deleteRetrySleep           = 5 * time.Second
 )
 
 var (
@@ -160,6 +162,7 @@ func (p *Provisioner) sendUpdate(t interface{}) {
 
 // removeMessageChan closes (if open) chan and removes it from the map
 func (p *Provisioner) removeMessageChan(claimID string, volID string) {
+	util.LogDebug.Printf("removeMessageChan called with claimID %s volID %s", claimID, volID)
 	p.id2chanLock.Lock()
 	defer p.id2chanLock.Unlock()
 
@@ -189,10 +192,10 @@ func NewProvisioner(clientSet *kubernetes.Clientset, provisionerName string, aff
 	id := uuid.NewV4()
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartRecordingToSink(&core_v1.EventSinkImpl{Interface: clientSet.Core().Events(v1.NamespaceAll)})
-	util.LogDebug.Printf("provisioner (prefix=%s) is being created with instance id %s.", provisionerName, id.String())
+	util.LogDebug.Printf("provisioner (prefix=%s) is being created with instance id %s and id2chan capacity %d.", provisionerName, id.String(), id2chanMapSize)
 	return &Provisioner{
 		kubeClient:              clientSet,
-		id2chan:                 make(map[string]chan *updateMessage, 100),
+		id2chan:                 make(map[string]chan *updateMessage, id2chanMapSize), //make a id to chan (updatemessage) map with a capacity of 1k entries
 		id2chanLock:             &sync.Mutex{},
 		affectDockerVols:        affectDockerVols,
 		namePrefix:              provisionerName + "/",
@@ -304,12 +307,16 @@ func (p *Provisioner) statusLogger() {
 func (p *Provisioner) deleteVolume(pv *api_v1.PersistentVolume, rmPV bool) {
 	provisioner := pv.Annotations[k8sProvisionedBy]
 
+	util.LogDebug.Printf("in deleteVolume: cleaning up pv:%s Status:%v with deleteChain %d parkedCommands %d with affectDockerVols %v", pv.Name, pv.Status, atomic.LoadUint32(&p.deleteCommandChains), atomic.LoadUint32(&p.parkedCommands), p.affectDockerVols)
+
 	// slow down a delete storm
 	limit(&p.deleteCommandChains, &p.parkedCommands, maxDeletes)
 
 	atomic.AddUint32(&p.deleteCommandChains, 1)
 	defer atomic.AddUint32(&p.deleteCommandChains, ^uint32(0))
-	deleteChain := chain.NewChain(chainRetries, chainTimeout)
+	deleteChain := chain.NewChain(chainRetries, deleteRetrySleep)
+
+	util.LogDebug.Printf("in deleteVolume: cleaning up pv:%s Status:%v with deleteChain %d parkedCommands %d with affectDockerVols %v", pv.Name, pv.Status, atomic.LoadUint32(&p.deleteCommandChains), atomic.LoadUint32(&p.parkedCommands), p.affectDockerVols)
 
 	// if the pv was just deleted, make sure we clean up the docker volume
 	if p.affectDockerVols {
@@ -344,7 +351,6 @@ func (p *Provisioner) deleteVolume(pv *api_v1.PersistentVolume, rmPV bool) {
 		p.eventRecorder.Event(pv, api_v1.EventTypeWarning, "DeleteVolume",
 			fmt.Sprintf("Failed to delete volume for pv %s: %v", pv.Name, err))
 	}
-
 }
 
 func (p *Provisioner) updateVolume(claim *api_v1.PersistentVolumeClaim, provisioner string, updateMap map[string]interface{}) error {

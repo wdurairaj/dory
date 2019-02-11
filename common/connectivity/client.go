@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	defaultTimeout = time.Duration(30) * time.Second
+	defaultTimeout = time.Duration(300) * time.Second
 )
 
 //Request encapsulates a request to the Do* family of functions

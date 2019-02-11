@@ -55,14 +55,15 @@ const (
 	// /var/lib/origin/openshift.local.volumes/pods/88917cdb-514d-11e7-93fb-5254005e615a/volumes/hpe~nimble/test2
 	// /var/lib/kubelet/pods/fb36bec9-51f7-11e7-8eb8-005056968cbc/volumes/hpe~nimble/test
 	mountPathRegex = "/var/lib/.*/pods/(?P<uuid>[\\w\\d-]*)/volumes/"
+
 	//docker volume status key
 	devicePathKey = "devicePath"
 	maxTries      = 3
 )
 
 var (
-	//createVolumes indicate whether the driver should create missing volumes
-	createVolumes = true
+	//createVolumes indicate whether the driver should create missing volumes. We should disable this by default as the volumes need to have filesystem on it else mount will fail.
+	createVolumes = false
 
 	execPath string
 
@@ -171,7 +172,7 @@ func Attach(jsonRequest string) (string, error) {
 
 func getOrCreate(name, jsonRequest string) (string, error) {
 	util.LogDebug.Printf("getOrCreate called with %s and %s\n", name, jsonRequest)
-	volume, err := dvp.Get(name)
+	volume, err := getVolume(name)
 	if err != nil || volume.Volume.Name != name {
 		if !createVolumes {
 			return "", fmt.Errorf("configured to NOT create volumes")
@@ -191,8 +192,30 @@ func getOrCreate(name, jsonRequest string) (string, error) {
 		}
 		return newName, nil
 	}
-
 	return volume.Volume.Name, nil
+}
+
+// wrapper for dvp.Get() with retries incorporated
+func getVolume(name string) (volume *dockervol.GetResponse, err error) {
+	util.LogDebug.Printf("getVolume called with %s", name)
+	try := 0
+	for {
+		util.LogDebug.Printf("dvp.Get() called with %s try:%d", name, try+1)
+		volume, err = dvp.Get(name)
+		util.LogDebug.Printf("volume returned from dvp.Get() is %#v", volume)
+		if volume != nil {
+			return volume, nil
+		}
+		if err != nil {
+			if try < maxTries {
+				try++
+				time.Sleep(time.Duration(try) * time.Second)
+				continue
+			}
+			return nil, err
+		}
+		return volume, nil
+	}
 }
 
 //Mount a volume
@@ -269,7 +292,7 @@ func Unmount(args []string) (string, error) {
 		return "", err
 	}
 
-	dockerPath, metadata, err := getDockerPathAndMetadata(args[0], devPath)
+	dockerPath, metadata, err := retryGetDockerPathAndMetadata(args[0], devPath)
 	if err != nil {
 		return "", err
 	}
@@ -334,7 +357,8 @@ func getMountID(path string) (string, error) {
 func getVolumeNameFromMountPath(k8sPath, dockerPath string) (string, error) {
 	util.LogDebug.Printf("getVolumeNameFromMountPath called with %s and %s", k8sPath, dockerPath)
 	name := filepath.Base(dockerPath)
-	dockerVolume, err := dvp.Get(name)
+	dockerVolume, err := getVolume(name)
+	util.LogDebug.Printf("retrieved dockerVolume %#v with name %s", dockerVolume, name)
 	if err != nil || dockerVolume.Volume.Name != name {
 		// The docker plugin might not use the docker volume name in the path.
 		// Therefore we need to look through the know volumes to find out who
@@ -352,6 +376,15 @@ func getVolumeNameFromMountPath(k8sPath, dockerPath string) (string, error) {
 		return "", fmt.Errorf("unable to find docker volume for %s.  No docker volume claimed to be mounted at %s", k8sPath, dockerPath)
 	}
 	if dockerVolume.Volume.Mountpoint == "" {
+		// it could be possible that the information on the container provider was removed as it was mounted by other host, so don't treat it as an error
+		util.LogDebug.Printf("found a docker volume but its MountPoint was \"\", checking from /proc/mounts")
+		devPath, _ := linux.GetDeviceFromMountPoint(dockerPath)
+		util.LogDebug.Printf("devPath %s was found for volume %s since MountPoint was \"\" in dockerVolume status", devPath, dockerVolume.Volume.Name)
+		if devPath != "" {
+			util.LogDebug.Printf("devPath %s for docker volume %s", devPath, dockerVolume.Volume.Name)
+			return dockerVolume.Volume.Name, nil
+		}
+
 		return "", fmt.Errorf("found a docker volume but its MountPoint was \"\"")
 	}
 	return dockerVolume.Volume.Name, nil
@@ -367,6 +400,29 @@ func findJSON(args []string, req *AttachRequest) (string, error) {
 		}
 	}
 	return "", err
+}
+
+func retryGetDockerPathAndMetadata(flexvolPath, devPath string) (string, string, error) {
+	util.LogDebug.Printf("retryGetDockerPathAndMetadata called with flexvolPath(%s) devPath(%s)", flexvolPath, devPath)
+	maxTries := 3
+	try := 0
+	for {
+		dockerPath, metadata, err := getDockerPathAndMetadata(flexvolPath, devPath)
+		if err != nil {
+			util.LogError.Printf("getDockerPathAndMetadata failed for flexvolPath %s, devPath %s : %s", flexvolPath, devPath, err.Error())
+			if try < maxTries {
+				try++
+				util.LogDebug.Printf("try=%d", try)
+				time.Sleep(time.Duration(try) * time.Second)
+				continue
+			}
+			return dockerPath, metadata, err
+		}
+		if err != nil {
+			return dockerPath, metadata, err
+		}
+		return dockerPath, metadata, nil
+	}
 }
 
 // return the dockerPath and a path to the metadata file if present
@@ -398,7 +454,7 @@ func getDockerPathAndMetadata(flexvolPath, devPath string) (string, string, erro
 		dockerPath = string(fileData)
 		util.LogDebug.Printf("getDockerPathAndMetadata: found dockerPath=%s for devPath=%s and flexvolPath=%s", dockerPath, devPath, flexvolPath)
 	}
-
+	util.LogDebug.Printf("getDockerPathAndMetadata: devPath=%s was mounted on dockerPath=%s", devPath, dockerPath)
 	return dockerPath, metadata, nil
 }
 
@@ -416,7 +472,7 @@ func doMount(flexvolPath, dockerPath, dockerName, mountID string) error {
 
 		//get the volume info
 		var volRes *dockervol.GetResponse
-		volRes, err = dvp.Get(dockerName)
+		volRes, err = getVolume(dockerName)
 		if err != nil {
 			return err
 		}
