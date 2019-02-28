@@ -541,6 +541,11 @@ func (p *Provisioner) newDockerVolumePluginClient(provisionerName string) (*dock
 	}
 	configPathName := fmt.Sprintf("%s%s/%s.json", flexVolumeBasePath, strings.Replace(provisionerName, "/", "~", 1), driverName[1])
 	util.LogDebug.Printf("looking for %s", configPathName)
+        util.LogDebug.Printf(" Driver name %s", driverName[1])
+        if driverName[1] == "hpe" {
+           util.LogDebug.Printf("Removing the manager key for hpe driver")
+           delete(defaultDockerOptions,"manager")
+        }
 	var (
 		socketFile                   = defaultSocketFile
 		strip                        = defaultStripValue
