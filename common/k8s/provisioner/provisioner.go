@@ -500,6 +500,12 @@ func (p *Provisioner) setDefaultDockerOptions(optionsMap map[string]interface{},
 			optionsMap[k] = val.Interface()
 		}
 	}
+        _, keyPresent := optionsMap["allowOverrides"]
+        if keyPresent {
+               util.LogInfo.Printf("Removing key allowOverrides")
+               delete(optionsMap, "allowOverrides")
+        }
+        
 	util.LogDebug.Printf("optionsMap %v", optionsMap)
 }
 

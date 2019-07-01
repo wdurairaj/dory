@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"time"
+        "strings"
 )
 
 const (
@@ -265,12 +266,28 @@ func Mount(args []string) (string, error) {
 	//    https://github.com/kubernetes/kubernetes/issues/20813
 	//    https://github.com/openshift/origin/issues/741
 	//    https://github.com/projectatomic/atomic-site/blob/master/source/blog/2015-06-15-using-volumes-with-docker-can-cause-problems-with-selinux.html.md
-	err = linux.Chcon("svirt_sandbox_file_t", path)
-	if err != nil {
-		return "", err
-	}
-
+        
+	if ! checkForNFSMount(path) {
+                util.LogDebug.Printf("WILLIAM: it is not a nfs mount")
+		err = linux.Chcon("svirt_sandbox_file_t", path)
+		if err != nil {
+	           return "", err
+		}
+	} else { 
+             
+             util.LogDebug.Printf("WILLIAM: nfs mount")
+             err = linux.Chcon("nfs_t", path)
+             if err != nil {
+                 return "", err
+             }
+        }
 	return BuildJSONResponse(&Response{Status: SuccessStatus}), nil
+}
+func checkForNFSMount(mountPath string) bool {
+	mountEntry, _ := linux.GetDeviceFromMountPoint(mountPath)
+	// mostly it's an nfs mount containing a VFS IP , followed
+	// by a colon and fpg, share etc.
+	return strings.Contains(mountEntry, ":") 
 }
 
 // Unmount a volume
